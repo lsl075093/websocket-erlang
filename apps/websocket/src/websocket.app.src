@@ -1,0 +1,20 @@
+{application, websocket,
+ [{description, "An OTP application"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {websocket_app, []}},
+  {applications,
+   [kernel,
+    stdlib,
+    inets,
+    asn1,
+    crypto,
+    public_key,
+    ssl
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["Apache 2.0"]},
+  {links, []}
+ ]}.
