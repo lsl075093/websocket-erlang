@@ -61,7 +61,10 @@ start_link(Arg) ->
     {stop, Reason :: term()} | ignore).
 init([OpenId, Socket, ConnPid]) ->
     erlang:process_flag(trap_exit, true),
-    erlang:display({?MODULE, ?LINE, start_a_player, Socket, self()}),
+    erlang:display({?MODULE, ?LINE, start_a_player, OpenId, self()}),
+
+    global:re_register_name(util:player_process_name(OpenId), self()),
+    global:re_register_name(util:conn_process_name(OpenId), ConnPid),
     {ok, #player{
         oppen_id = OpenId,
         socket = Socket,
@@ -83,14 +86,8 @@ init([OpenId, Socket, ConnPid]) ->
     {noreply, NewPlayer :: #player{}, timeout() | hibernate} |
     {stop, Reason :: term(), Reply :: term(), NewPlayer :: #player{}} |
     {stop, Reason :: term(), NewPlayer :: #player{}}).
-handle_call(Msg, From, Player) ->
-    try
-        do_handle_call(Msg, From, Player)
-    catch _:_Error ->
-        io:format("do_handle_call Msg:~w, Error:~w, ~p", [Msg, _Error, erlang:get_stacktrace()]),
-        {reply, error, Player}
-    end.
-do_handle_call(_Request, _From, Player) ->
+
+handle_call(_Request, _From, Player) ->
     io:format("module:~p: handle_call unexpect message:~p", [?MODULE, _Request]),
     {reply, ok, Player}.
 
@@ -105,15 +102,23 @@ do_handle_call(_Request, _From, Player) ->
     {noreply, NewPlayer :: #player{}} |
     {noreply, NewPlayer :: #player{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewPlayer :: #player{}}).
-handle_cast(Msg, Player) ->
-    try
-        do_handle_cast(Msg, Player)
-    catch _:_Error ->
-        io:format("do handle_cast Msg:~w, Error:~w, ~p", [Msg, _Error, erlang:get_stacktrace()]),
-        {noreply, Player}
-    end.
-do_handle_cast(_Request, Player) ->
-    io:format("module:~p: handle_cast unexpect message:~p", [?MODULE, _Request]),
+
+handle_cast({apply_cast, Mod, Fun, Arg}, Player) ->
+    case apply(Mod, Fun, [Player|Arg]) of
+        NewPlayer when is_record(NewPlayer, player) ->
+            {noreply, NewPlayer};
+        _ ->
+            {noreply, Player}
+    end;
+handle_cast({socket_event, Handler, Cmd, Data}, Player) ->
+    case Handler:handle_event(Cmd, Player,Data) of
+        NewPlayer when is_record(NewPlayer, player) ->
+            {noreply, NewPlayer};
+        _ ->
+            {noreply, Player}
+    end;
+
+handle_cast(_Request, Player) ->
     {noreply, Player}.
 
 %%--------------------------------------------------------------------
@@ -130,18 +135,12 @@ do_handle_cast(_Request, Player) ->
     {noreply, NewPlayer :: #player{}} |
     {noreply, NewPlayer :: #player{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewPlayer :: #player{}}).
-handle_info(Msg, Player) ->
-    try
-        do_handle_info(Msg, Player)
-    catch _:_Error ->
-        io:format("do handle_info Msg:~w, Error:~w, ~p", [Msg, _Error, erlang:get_stacktrace()]),
-        {noreply, Player}
-    end.
 
-do_handle_info({'EXIT', ConnPid, normal}, #player{conn_pid = ConnPid} = Player) ->
+handle_info({'EXIT', ConnPid, _}, #player{conn_pid = ConnPid} = Player) ->
+    offline(Player),
     {stop, ok, Player};
 
-do_handle_info(_Info, Player) ->
+handle_info(_Info, Player) ->
     io:format("module:~p: handle_info unexpect message:~p", [?MODULE, _Info]),
     {noreply, Player}.
 
@@ -159,7 +158,11 @@ do_handle_info(_Info, Player) ->
 -spec(terminate(Reason :: (normal | shutdown | {shutdown, term()} | term()),
     Player :: #player{}) ->
     term()).
-terminate(_Reason, _Player) ->
+terminate(normal, Player) ->
+    offline(Player),
+    ok;
+terminate(_Reason, Player) ->
+    offline(Player),
     ok.
 
 %%--------------------------------------------------------------------
@@ -179,3 +182,7 @@ code_change(_OldVsn, Player, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+offline(Player) ->
+    erlang:display({?MODULE, ?LINE, player_offline}),
+    wuzi_go:offline(Player),
+    ok.

@@ -37,7 +37,7 @@
 -spec(start_link(Args :: term()) ->
     {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
 start_link(Port) ->
-    gen_server:start_link(?MODULE, [Port], []).
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [Port], []).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -58,7 +58,6 @@ start_link(Port) ->
     {ok, State :: #state{}} | {ok, State :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term()} | ignore).
 init([Port]) ->
-    erlang:process_flag(trap_exit, true),
     {ok, Listen} =
         gen_tcp:listen(Port,
         [

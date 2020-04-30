@@ -7,24 +7,19 @@
 -module(router).
 -author("liushl").
 
--compile(export_all).
 %% API
--export([]).
+-export([router/2]).
 -include("socket_conn.hrl").
 
-router(#socket_conn{player_pid = Pid} = State, Bin) ->
-    Str = unicode:characters_to_list(Bin),
-    [CmdStr|Data] = string:tokens(Str, ","),
-    Cmd = list_to_integer(CmdStr),
+router(#socket_conn{player_pid = Pid} = State, <<Cmd:32, Bin/binary>>) ->
     CmdType = Cmd div 100,
     case router_by_cmd(CmdType) of
         {conn, Handler} ->
-            self() ! read_next,
-            Handler:handle_event(Cmd, State, Data);
+            Handler:handle_event(Cmd, State, Bin);
         {player, Handler} when is_pid(Pid) ->
-            gen_server:cast(Pid, {socket_event, Handler, Cmd, Data}),
+            gen_server:cast(Pid, {socket_event, Handler, Cmd, Bin}),
             State;
-        error ->
+        _ ->
             State
     end;
 router(State, _Bin) ->

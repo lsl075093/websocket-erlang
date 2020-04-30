@@ -13,10 +13,13 @@
 -export([handle_event/3]).
 
 
-handle_event(1, State, [APPID, AppSerect, Code]) ->
+handle_event(1, State, Bin) ->
+    {APPID, Rest} = util:read_string(Bin),
+    {AppSerect, Rest1} = util:read_string(Rest),
+    {Code, _} = util:read_string(Rest1),
     case request_weixin_server(APPID, AppSerect, Code) of
         {ok, OpenId} ->
-            erlang:display({?MODULE, ?LINE, OpenId}),
+            util:send_to_socket(State#socket_conn.socket, <<1:32>>),
             State#socket_conn{open_id = OpenId};
         {error, Err} ->
             erlang:display({?MODULE, ?LINE, Err}),
@@ -28,6 +31,7 @@ handle_event(_, State, _Info) ->
 
 
 request_weixin_server(APPID, AppSerect, Code) ->
+    erlang:display({?MODULE, ?LINE, APPID, AppSerect, Code}),
     Url = lists:concat([
         "https://api.weixin.qq.com/sns/jscode2session?appid=", APPID,
         "&secret=", AppSerect,
@@ -52,6 +56,7 @@ request_weixin_server(APPID, AppSerect, Code) ->
                         {_, OpenId} ->
                             {ok, OpenId};
                         _ ->
+                            erlang:display({?MODULE, ?LINE, Json}),
                             {error, no_open_id_return}
                     end;
                 {error, Err} ->

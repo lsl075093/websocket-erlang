@@ -10,7 +10,6 @@
 -behaviour(gen_server).
 
 -include("socket_conn.hrl").
--compile(export_all).
 
 %% API
 -export([start/1]).
@@ -22,6 +21,17 @@
     handle_info/2,
     terminate/2,
     code_change/3]).
+
+-export([
+    is_websocket_handshake/2,
+    encode/1,
+    encode_list/1,
+    encode_begin/1,
+    encode_continue/1,
+    encode_end/1,
+    send_to_client/2
+]).
+
 
 -define(SERVER, ?MODULE).
 
@@ -79,6 +89,10 @@ start([Socket]) ->
 init([Socket]) ->
     erlang:process_flag(trap_exit, true),
     erlang:display({?MODULE, ?LINE, start_a_websocket, Socket, self()}),
+    inet:setopts(Socket, [
+        {buffer, 5000},
+        {delay_send, true}
+    ]),
     {ok, #socket_conn{socket = Socket}}.
 
 %%--------------------------------------------------------------------
@@ -127,25 +141,51 @@ handle_cast(_Request, State) ->
     {noreply, NewState :: #socket_conn{}} |
     {noreply, NewState :: #socket_conn{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #socket_conn{}}).
-handle_info({tcp, Socket, Bin}, #socket_conn{socket = Socket, data = DataOld, msg_queue = Q} = State) ->
-    case decode(Bin) of
-        close ->
-            gen_tcp:shutdown(Socket, read_write),
+%%handle_info({tcp, Socket, Bin}, #socket_conn{socket = Socket, data = DataOld, msg_queue = Q} = State) ->
+%%    erlang:display({?MODULE, ?LINE, receive_a_massage}),
+%%    case decode(Bin) of
+%%        close ->
+%%            gen_tcp:shutdown(Socket, read_write),
+%%            erlang:display({?MODULE, ?LINE, shutdown_a_websocket, Socket}),
+%%            {stop, normal, State};
+%%        {go_end, {DataAdd, _}} ->
+%%            Msg = <<DataOld/binary, DataAdd/binary>>,
+%%            io:format("~p, ~p: ~ts~n", [?MODULE, ?LINE, Msg]),
+%%            case queue:is_empty(Q) of
+%%                true  ->
+%%                    NewState = router:router(State, Msg),
+%%                    {noreply, NewState#socket_conn{data = <<>>}};
+%%                false ->
+%%                    {noreply, State#socket_conn{data = <<>>, msg_queue = queue:in(Msg, Q)}}
+%%            end;
+%%        {go_one, {DataAdd, _}} ->
+%%            erlang:display({?MODULE, ?LINE, go_on}),
+%%            io:format("~p, ~p: ~ts~n", [?MODULE, ?LINE, DataAdd]),
+%%            {noreply, State#socket_conn{data = <<DataOld/binary, DataAdd/binary>>}};
+%%        Error ->
+%%            erlang:display({?MODULE, ?LINE, Error}),
+%%            {noreply, State}
+%%    end;
+handle_info({tcp, Socket, Bin}, #socket_conn{socket = Socket} = State) ->
+    erlang:display({?MODULE, ?LINE, receive_a_massage}),
+    case websocket_fragment:decode(Bin) of
+        {close_socket, Fragments} ->
+            deal_with_fragment(State, Fragments),
+            gen_tcp:send(Socket, websocket_fragment:encode_close()),
+            gen_tcp:close(Socket),
             erlang:display({?MODULE, ?LINE, shutdown_a_websocket, Socket}),
             {stop, normal, State};
-        {go_end, DataAdd} ->
-            Msg = <<DataOld/binary, DataAdd/binary>>,
-            io:format("~p, ~p: ~ts~n", [?MODULE, ?LINE, Msg]),
-            case queue:is_empty(Q) of
-                true  ->
-                    NewState = router:router(State, Msg),
-                    {noreply, NewState#socket_conn{data = <<>>}};
-                false ->
-                    {noreply, State#socket_conn{data = <<>>, msg_queue = queue:in(Msg, Q)}}
-            end;
-        {go_one, DataAdd} ->
-            {noreply, State#socket_conn{data = <<DataOld/binary, DataAdd/binary>>}};
-        _ ->
+        {error, Error, Fragments} ->
+            erlang:display({?MODULE, ?LINE, Error}),
+            NewState = deal_with_fragment(State, Fragments),
+            gen_tcp:send(Socket, websocket_fragment:encode_close()),
+            gen_tcp:close(Socket),
+            {stop, Error, NewState};
+        Fragments when is_list(Fragments) ->
+            NewState = deal_with_fragment(State, Fragments),
+            {noreply, NewState};
+        Other ->
+            erlang:display({?MODULE, ?LINE, Other}),
             {noreply, State}
     end;
 handle_info({tcp_closed, Socket}, #socket_conn{socket = Socket} = State) ->
@@ -153,20 +193,19 @@ handle_info({tcp_closed, Socket}, #socket_conn{socket = Socket} = State) ->
     erlang:display({?MODULE, ?LINE, close_a_websocket, Socket}),
     {stop, normal, State};
 
-handle_info(read_next, #socket_conn{msg_queue = Q} = State) ->
-    case queue:out(Q) of
-        {{value, Msg}, NQ} ->
-            NewState = router:router(State, Msg);
-        {empty, Q} ->
-            NewState = State,
-            NQ = Q
-    end,
-    {noreply, NewState#socket_conn{msg_queue = NQ}};
+handle_info({send_to_clent, Msg}, #socket_conn{socket = Socket} = State) ->
+    gen_tcp:send(Socket, encode(Msg)),
+    {noreply, State};
 
 handle_info(_Info, State) ->
     io:format("module:~p: handle_info unexpect message:~p", [?MODULE, _Info]),
     {noreply, State}.
 
+deal_with_fragment(State, []) -> State;
+deal_with_fragment(State, [Fragment|T]) ->
+    io:format("~p, ~p: ~ts~n", [?MODULE, ?LINE, Fragment]),
+    NewState = router:router(State, Fragment),
+    deal_with_fragment(NewState, T).
 %%--------------------------------------------------------------------
 %% @private
 %% @doc
@@ -324,7 +363,7 @@ decode_handshake(State, []) -> State.
 %%Opcode: 4个比特。
 %%操作代码，Opcode的值决定了应该如何解析后续的数据载荷（data payload）。如果操作代码是不认识的，那么接收端应该断开连接（fail the connection）。可选的操作代码如下：
 %%
-%%% x0：表示一个延续帧。当Opcode为0时，表示本次数据传输采用了数据分片，当前收到的数据帧为其中一个数据分片。
+%%% x0：表示一个延续帧。当Opcode为0时，表示本次数据传输采用了数据分片，当前收到的数据帧为其中一个数据分片, 且改分片不是初始分片。
 %%% x1：表示这是一个文本帧（frame）
 %%% x2：表示这是一个二进制帧（frame）
 %%% x3-7：保留的操作代码，用于后续定义的非控制帧。
@@ -352,7 +391,8 @@ decode_handshake(State, []) -> State.
 %%Payload data：(x+y) 字节
 %%载荷数据：包括了扩展数据、应用数据。其中，扩展数据x字节，应用数据y字节。
 %%
-%%扩展数据：如果没有协商使用扩展的话，扩展数据数据为0字节。所有的扩展都必须声明扩展数据的长度，或者可以如何计算出扩展数据的长度。此外，扩展如何使用必须在握手阶段就协商好。如果扩展数据存在，那么载荷数据长度必须将扩展数据的长度包含在内。
+%% 扩展数据：如果没有协商使用扩展的话，扩展数据数据为0字节。所有的扩展都必须声明扩展数据的长度，或者可以如何计算出扩展数据的长度。
+%% 此外，扩展如何使用必须在握手阶段就协商好。如果扩展数据存在，那么载荷数据长度必须将扩展数据的长度包含在内。
 %%
 %%应用数据：任意的应用数据，在扩展数据之后（如果存在扩展数据），占据了数据帧剩余的位置。载荷数据长度 减去 扩展数据长度，就得到应用数据的长度。
 %%
@@ -386,13 +426,15 @@ decode(Bin) ->
             nothing
     end.
 decode1(Bin, 0, L) ->
-    <<MaskingKey:4/binary, DataBin:L/binary, _/binary>> = Bin,
-    mask_data(MaskingKey, DataBin);
+    <<MaskingKey:4/binary, DataBin:L/binary, Last/binary>> = Bin,
+    erlang:display({?MODULE, ?LINE, Last}),
+    {mask_data(MaskingKey, DataBin), Last};
 decode1(Bin, Continue, _) ->
+    erlang:display({?MODULE, ?LINE, Continue}),
     <<Length:Continue, MaskingKey:4/binary, Rest/binary>> = Bin,
-    <<DataBin:Length/binary, _/binary>> = Rest,
-    Data = mask_data(MaskingKey, DataBin),
-    Data.
+    erlang:display({?MODULE, ?LINE, Length}),
+    <<DataBin:Length/binary, Last/binary>> = Rest,
+    {mask_data(MaskingKey, DataBin), Last}.
 
 mask_data(MaskingKey, DataBin) ->
     <<Mask1:8, Mask2:8, Mask3:8, Mask4:8>> = MaskingKey,
@@ -405,13 +447,50 @@ mask_data(<<Bin:8, Rest/binary>>, Keys, I, List) ->
 mask_data(_, _, _, List) ->
     list_to_binary(lists:reverse(List)).
 
+
+
 %% 打包
 encode(Msg) ->
     Bin = unicode:characters_to_binary(Msg),
     Fin = 1, Rsv = 0, OpCode = 2, Mask = 0,
     Payload = erlang:byte_size(Bin),
-    <<Fin:1, Rsv:3, OpCode:4, Mask:1, 127:7, Payload:64, Bin/binary>>.
+    case Payload >= 126 of
+        true  ->
+            <<Fin:1, Rsv:3, OpCode:4, Mask:1, 126:7, Payload:16, Bin/binary>>;
+        false ->
+            <<Fin:1, Rsv:3, OpCode:4, Mask:1, Payload:7, Bin/binary>>
+    end.
+
+encode_list(Msg) ->
+    Bin = unicode:characters_to_binary(Msg),
+    Fin = 1, Rsv = 0, OpCode = 2, Mask = 0,
+    Payload = erlang:byte_size(Bin),
+    case Payload >= 126 of
+        true  ->
+            <<Fin:1, Rsv:3, OpCode:4, Mask:1, 126:7, Payload:16, Bin/binary>>;
+        false ->
+            <<Fin:1, Rsv:3, OpCode:4, Mask:1, Payload:7, Bin/binary>>
+    end.
+
+%% 分包开始
+encode_begin(Msg) ->
+    Bin = unicode:characters_to_binary(Msg),
+    Fin = 0, Rsv = 0, OpCode = 1, Mask = 0,
+    Payload = erlang:byte_size(Bin),
+    <<Fin:1, Rsv:3, OpCode:4, Mask:1, Payload:7, Bin/binary>>.
+%% 分包连续
+encode_continue(Msg) ->
+    Bin = unicode:characters_to_binary(Msg),
+    Fin = 0, Rsv = 0, OpCode = 0, Mask = 0,
+    Payload = erlang:byte_size(Bin),
+    <<Fin:1, Rsv:3, OpCode:4, Mask:1, Payload:7, Bin/binary>>.
+%% 分包结束
+encode_end(Msg) ->
+    Bin = unicode:characters_to_binary(Msg),
+    Fin = 1, Rsv = 0, OpCode = 0, Mask = 0,
+    Payload = erlang:byte_size(Bin),
+    <<Fin:1, Rsv:3, OpCode:4, Mask:1, Payload:7, Bin/binary>>.
 
 %% 给客户端发消息
-send_to_client(Socket, Msg) ->
-    gen_tcp:send(Socket, encode(Msg)).
+send_to_client(ConnPid, Msg) ->
+    ConnPid ! {send_to_clent, Msg}.
